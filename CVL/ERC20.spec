@@ -150,7 +150,7 @@ rule depositArithmetic(env e) {
 }
 
 /// @title Sender ETH balance increases correctly, native eth locked in contract decreases correctly, sender token balance is decreased correctly
-// Note: This function requires enabling `optimistic_fallback` in the conf file (it is fine to disable havoc because the calldata of transfers is empty)
+// Note: this rule models EOAs with optimistic_fallback; callback safety is checked separately in Callbacks.spec
 // TODO: can you construct an adversarial 7702 receiver that creates issues?
 rule eoaWithdrawalArithmetic(env e) {
     // sender is not using 7702 account abstraction (this allows us to check for resulting eth balance of sender)
@@ -202,4 +202,165 @@ rule withdrawalIsAlwaysPossible(env e) {
     withdraw@withrevert(e, amount);
 
     assert !lastReverted, "Withdrawal unexpectedly reverted";
+}
+
+// approval is an overwrite, including zero revocation, not an increment
+/// @title Approval overwrites exactly one allowance and leaves other state unchanged
+rule approvalCorrectAndIsolated(env e, address spender, uint256 amount, address owner, address otherSpender, address holder) {
+    require e.msg.value == 0;
+    uint256 unrelated = allowance(owner, otherSpender);
+    uint256 balance = balanceOf(holder);
+    uint256 supply = totalSupply();
+    uint256 reserves = nativeBalances[currentContract];
+    bool result = approve@withrevert(e, spender, amount);
+    assert !lastReverted && result;
+    assert allowance(e.msg.sender, spender) == amount;
+    assert (owner != e.msg.sender || otherSpender != spender) => allowance(owner, otherSpender) == unrelated;
+    assert balanceOf(holder) == balance;
+    assert totalSupply() == supply && nativeBalances[currentContract] == reserves;
+}
+
+// only approve(owner, spender) and spending that exact pair may change it
+/// @title Operations preserve every unrelated allowance
+rule unrelatedAllowancesUnchanged(env e, uint8 action, address from, address to, uint256 amount, address owner, address spender) {
+    require action < 5;
+    uint256 before = allowance(owner, spender);
+    if (action == 0) {
+        transfer(e, to, amount);
+    } else if (action == 1) {
+        require owner != from || spender != e.msg.sender;
+        transferFrom(e, from, to, amount);
+    } else if (action == 2) {
+        require owner != e.msg.sender || spender != to;
+        approve(e, to, amount);
+    } else if (action == 3) {
+        deposit(e);
+    } else {
+        require nativeCodesize[e.msg.sender] == 0;
+        withdraw(e, amount);
+    }
+    assert allowance(owner, spender) == before;
+}
+
+/// @title A valid transfer succeeds, including zero amounts and self-transfers
+rule validTransferSucceeds(env e, address to, uint256 amount) {
+    require e.msg.value == 0;
+    require to != 0;
+    require amount <= balanceOf(e.msg.sender);
+    require to == e.msg.sender || balanceOf(to) <= max_uint256 - amount;
+    bool result = transfer@withrevert(e, to, amount);
+    assert !lastReverted && result;
+}
+
+/// @title A funded and authorized transferFrom succeeds
+rule validTransferFromSucceeds(env e, address from, address to, uint256 amount) {
+    require e.msg.value == 0;
+    require to != 0;
+    require amount <= balanceOf(from);
+    require amount <= allowance(from, e.msg.sender);
+    require to == from || balanceOf(to) <= max_uint256 - amount;
+    bool result = transferFrom@withrevert(e, from, to, amount);
+    assert !lastReverted && result;
+}
+
+/// @title A funded deposit within the cap succeeds
+rule validDepositSucceeds(env e) {
+    require e.msg.sender != 0 && e.msg.sender != currentContract;
+    require e.msg.value > 0;
+    require totalSupply() <= MAX_SUPPLY();
+    require e.msg.value <= MAX_SUPPLY() - totalSupply();
+    require balanceOf(e.msg.sender) <= max_uint256 - e.msg.value;
+    require nativeBalances[e.msg.sender] >= e.msg.value;
+    require nativeBalances[currentContract] <= max_uint256 - e.msg.value;
+    deposit@withrevert(e);
+    assert !lastReverted;
+}
+
+/// @title Successful ERC20 calls return true
+rule successfulCallsReturnTrue(env e, uint8 action, address from, address to, uint256 amount) {
+    require action < 3;
+    bool result;
+    if (action == 0) result = transfer(e, to, amount);
+    else if (action == 1) result = transferFrom(e, from, to, amount);
+    else result = approve(e, to, amount);
+    assert result;
+}
+
+/// @title Rejected transferFrom calls restore allowances and balances
+rule failedTransferFromRollsBack(env e, address from, address to, uint256 amount, address owner, address spender, address holder) {
+    require e.msg.value == 0;
+    require to == 0 || amount > balanceOf(from) || amount > allowance(from, e.msg.sender);
+    uint256 oldAllowance = allowance(owner, spender);
+    uint256 oldBalance = balanceOf(holder);
+    uint256 oldSupply = totalSupply();
+    uint256 oldReserves = nativeBalances[currentContract];
+    transferFrom@withrevert(e, from, to, amount);
+    assert lastReverted;
+    assert allowance(owner, spender) == oldAllowance && balanceOf(holder) == oldBalance;
+    assert totalSupply() == oldSupply && nativeBalances[currentContract] == oldReserves;
+}
+
+// explicit self-transfer semantics
+/// @title A successful self-transfer preserves its balance
+rule selfTransferPreservesBalance(env e, uint256 amount) {
+    uint256 before = balanceOf(e.msg.sender);
+    bool result = transfer(e, e.msg.sender, amount);
+    assert result && balanceOf(e.msg.sender) == before;
+}
+
+// typed event hooks inspect the actual emitted topics and data
+ghost mathint transferEvents;
+ghost mathint approvalEvents;
+ghost address transferFromEvent;
+ghost address transferToEvent;
+ghost uint256 transferAmountEvent;
+ghost address approvalOwnerEvent;
+ghost address approvalSpenderEvent;
+ghost uint256 approvalAmountEvent;
+ghost mathint transferPosition;
+ghost mathint approvalPosition;
+
+hook event Transfer(address indexed from, address indexed to, uint256 amount) {
+    transferEvents = transferEvents + 1;
+    transferPosition = transferEvents + approvalEvents;
+    transferFromEvent = from;
+    transferToEvent = to;
+    transferAmountEvent = amount;
+}
+hook event Approval(address indexed owner, address indexed spender, uint256 amount) {
+    approvalEvents = approvalEvents + 1;
+    approvalPosition = transferEvents + approvalEvents;
+    approvalOwnerEvent = owner;
+    approvalSpenderEvent = spender;
+    approvalAmountEvent = amount;
+}
+
+/// @title Successful operations emit the expected event arguments, counts, and order
+rule operationEvents(env e, uint8 action, address from, address to, uint256 amount) {
+    require action < 5;
+    transferEvents = 0;
+    approvalEvents = 0;
+    uint256 oldAllowance = allowance(from, e.msg.sender);
+    if (action == 0) transfer(e, to, amount);
+    else if (action == 1) transferFrom(e, from, to, amount);
+    else if (action == 2) approve(e, to, amount);
+    else if (action == 3) deposit(e);
+    else {
+        require nativeCodesize[e.msg.sender] == 0;
+        withdraw(e, amount);
+    }
+    assert transferEvents == (action == 2 ? 0 : 1);
+    if (action != 2) {
+        assert transferFromEvent == (action == 3 ? 0 : (action == 1 ? from : e.msg.sender));
+        assert transferToEvent == (action == 4 ? 0 : (action == 3 ? e.msg.sender : to));
+        assert transferAmountEvent == (action == 3 ? e.msg.value : amount);
+        assert transferPosition == (action == 1 ? 2 : 1);
+    }
+    if (action == 1 || action == 2) {
+        assert approvalOwnerEvent == (action == 1 ? from : e.msg.sender);
+        assert approvalSpenderEvent == (action == 1 ? e.msg.sender : to);
+        assert approvalAmountEvent == (action == 1 ? oldAllowance - amount : amount);
+        assert approvalPosition == 1;
+    }
+    assert approvalEvents == (action == 1 || action == 2 ? 1 : 0);
 }

@@ -4,6 +4,13 @@ pragma solidity ^0.8.35;
 import {ERC20} from "../../ERC20.sol";
 
 interface Vm {
+    struct Log {
+        bytes32[] topics;
+        bytes data;
+        address emitter;
+    }
+    function recordLogs() external;
+    function getRecordedLogs() external returns (Log[] memory);
     function assume(bool condition) external;
     function prank(address sender) external;
     function deal(address account, uint256 balance) external;
@@ -65,6 +72,13 @@ abstract contract ProofBase {
         internal
         returns (bool success)
     {
+        (success,) = stepResult(action, caller, from, to, amount);
+    }
+
+    function stepResult(uint8 action, address caller, address from, address to, uint256 amount)
+        internal
+        returns (bool success, bytes memory result)
+    {
         vm.assume(action < 5);
         bytes memory data;
         uint256 value;
@@ -81,6 +95,6 @@ abstract contract ProofBase {
             data = abi.encodeCall(token.withdraw, (amount));
         }
         vm.prank(caller);
-        (success,) = address(token).call{value: value}(data);
+        (success, result) = address(token).call{value: value}(data);
     }
 }

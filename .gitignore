@@ -1,6 +1,9 @@
 *.md
+!/README.md
 /out/
 /cache/
 /Halmos/results/
 /CVL/results/
+/CVL/verify.py
+/Halmos/verify.py
 __pycache__/

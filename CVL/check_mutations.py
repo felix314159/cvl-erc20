@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an unmodified CVL baseline, then the same seven bugs as the Halmos suite.
+"""Run an unmodified CVL baseline, then the accounting and expanded-coverage mutations.
 
 Source files are copied into a fresh results directory. Detection requires 
 FAIL for the selected property in Certora's structured output.json.
@@ -34,7 +34,34 @@ MUTATIONS = [
      "tokenSupplyCantExceedUpperCap"),
     ("withdraw_disabled", '        require(amount > 0, "Amount must be positive");', '        require(false, "disabled");',
      "withdrawalIsAlwaysPossible"),
+    ("extra_allowance", "        _approve(msg.sender, spender, amount);",
+     "        _approve(msg.sender, spender, amount);\n        _allowances[msg.sender][address(0xBEEF)] = type(uint256).max;",
+     "approvalCorrectAndIsolated"),
+    ("blocked_recipient", '        require(recipient != address(0), "Transfer to zero address");',
+     '        require(recipient != address(0xBEEF), "blocked");\n        require(recipient != address(0), "Transfer to zero address");',
+     "validTransferSucceeds"),
+    ("false_return", "        _transfer(msg.sender, recipient, amount);\n        return true;",
+     "        _transfer(msg.sender, recipient, amount);\n        return false;", "successfulCallsReturnTrue"),
+    ("failed_contract_payment", '        require(success, "ETH transfer failed");',
+     '        require(success || msg.sender.code.length > 0, "ETH transfer failed");', "rejectingWithdrawalRollsBack"),
+    ("missing_transfer_event", "        emit Transfer(sender, recipient, amount);", "", "operationEvents"),
+    ("wrong_transfer_event", "        emit Transfer(sender, recipient, amount);",
+     "        emit Transfer(recipient, sender, amount);", "operationEvents"),
+    ("late_burn", "        balanceOf[msg.sender] -= amount;\n        totalSupply -= amount;", "",
+     "reentrantWithdrawal"),
+
 ]
+
+
+RULE_SUITES = {"rejectingWithdrawalRollsBack": "receivers", "reentrantWithdrawal": "receivers"}
+
+
+def mutated_source(original, name, old, new):
+    source = original.replace(old, new)
+    if name == "late_burn":
+        guard = '        require(success, "ETH transfer failed");'
+        source = source.replace(guard, guard + "\n        balanceOf[msg.sender] -= amount;\n        totalSupply -= amount;")
+    return source
 
 
 def outcomes(node, path=""):
@@ -105,13 +132,16 @@ def main():
 
     env = os.environ.copy()
     env["CERTORA"] = str(build)
+    env["CERTORA_DISABLE_POPUP"] = "1"
     solver_dirs = sorted((prover / ".local-tools").glob("cvc5-*/cvc5-*/bin"))
     env["PATH"] = os.pathsep.join(map(str, [build, python.parent, *solver_dirs])) + os.pathsep + env.get("PATH", "")
     for tool in ("java", "solc", "z3", "cvc5"):
         if not shutil.which(tool, path=env["PATH"]):
             parser.error(f"Missing local dependency: {tool}")
 
-    inputs = {name: (ROOT / name).read_bytes() for name in ("ERC20.sol", "CVL/ERC20.spec", "CVL/ERC20.conf")}
+    input_names = ["ERC20.sol", *[str(p.relative_to(ROOT)) for p in (ROOT / "CVL").glob("*.spec")],
+                   *[str(p.relative_to(ROOT)) for p in (ROOT / "CVL").glob("*.conf")], "verification/Receivers.sol"]
+    inputs = {name: (ROOT / name).read_bytes() for name in input_names}
     original = inputs["ERC20.sol"].decode()
     spec = inputs["CVL/ERC20.spec"].decode()
     config = json.loads(inputs["CVL/ERC20.conf"])
@@ -120,7 +150,7 @@ def main():
         parser.error("No rule/invariant declarations found in CVL/ERC20.spec")
     selected = [m for m in MUTATIONS if args.only is None or m[0] in args.only]
     for name, old, _, rule in selected:
-        if original.count(old) != 1 or rule not in properties:
+        if original.count(old) != 1 or rule not in properties + ["rejectingWithdrawalRollsBack", "reentrantWithdrawal"]:
             parser.error(f"Mutation {name} no longer matches the contract/specification")
 
     results = ROOT / "CVL/results/mutations"
@@ -138,6 +168,23 @@ def main():
         (session / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
     def verify(name, source, rules):
+        if len(rules) == 1 and rules[0] in RULE_SUITES:
+            from verify import verify as verify_suite
+            parent = session / name
+            parent.mkdir()
+            started = time.monotonic()
+            record = verify_suite(prover, parent, RULE_SUITES[rules[0]], rules, source)
+            record["name"] = name
+            record["seconds"] = round(time.monotonic() - started, 2)
+            record["timed_out"] = record["timeout"]
+            try:
+                data = json.loads((Path(record["directory"]) / "output.json").read_text())["rules"]
+                record["outcomes"] = {rule: outcomes(data[rule], rule) for rule in rules}
+                record["all_outcomes"] = outcomes(data)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                record["error"] = str(error)
+                record["outcomes"] = {}
+            return record
         dest = session / name
         dest.mkdir()
         (dest / "ERC20.sol").write_text(source)
@@ -173,8 +220,17 @@ def main():
         if not baseline["passed"]:
             raise SystemExit(f"Baseline must pass first; inspect {session / 'baseline/run.log'}")
 
+        from verify import verify as verify_suite
+        summary["additional_baselines"] = []
+        for suite in ("callbacks", "receivers"):
+            record = verify_suite(prover, session, suite)
+            summary["additional_baselines"].append(record)
+            save()
+            if not record["passed"]:
+                raise SystemExit(f"{suite} baseline failed; see {record['directory']}")
+
         for name, old, new, rule in selected:
-            record = verify(name, original.replace(old, new), [rule])
+            record = verify(name, mutated_source(original, name, old, new), [rule])
             statuses = {o["status"] for o in record.get("outcomes", {}).get(rule, [])}
             all_statuses = {o["status"] for o in record.get("all_outcomes", [])}
             resolved = (record["exit_code"] in (0, 1) and not record["timed_out"]
