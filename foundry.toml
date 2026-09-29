@@ -1,0 +1,11 @@
+[profile.default]
+src = "Halmos/src"
+test = "Halmos/test"
+out = "out"
+libs = []
+solc_version = "0.8.35"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+bytecode_hash = "none"

@@ -1,0 +1,4 @@
+[global]
+solver = "z3"
+solver-timeout-assertion = 0
+solver-threads = 4
