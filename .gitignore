@@ -1,0 +1,6 @@
+*.md
+/out/
+/cache/
+/Halmos/results/
+/CVL/results/
+__pycache__/
